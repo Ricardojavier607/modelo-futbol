@@ -18,6 +18,24 @@ BACKTEST_WINDOW = 500
 FB_BASE = "https://www.football-data.co.uk/mmz4281"
 TEMPORADAS_DEFAULT = ['2425', '2324', '2223', '2122', '2021']
 
+ODDS_CANDIDATES = [
+    ('PSCH','PSCD','PSCA'),   # Pinnacle cierre
+    ('PSH','PSD','PSA'),      # Pinnacle apertura
+    ('B365CH','B365CD','B365CA'),
+    ('B365H','B365D','B365A'),
+    ('WHH','WHD','WHA'),
+    ('IWH','IWD','IWA'),
+    ('VCH','VCD','VCA'),
+    ('BWH','BWD','BWA'),
+]
+
+ALL_ODDS_COLS = [
+    'PSCH','PSCD','PSCA','PSH','PSD','PSA',
+    'B365CH','B365CD','B365CA','B365H','B365D','B365A',
+    'WHH','WHD','WHA','IWH','IWD','IWA',
+    'VCH','VCD','VCA','BWH','BWD','BWA',
+]
+
 LIGAS = {
     'LaLiga (España)': 'SP1',
     'Premier League': 'E0',
@@ -55,6 +73,18 @@ def kelly_stake(p, o, bankroll):
     stake = min(bankroll * kelly * KELLY_FRACTION, bankroll * MAX_STAKE_FRAC)
     return max(0.0, stake), edge
 
+def get_odds_from_row(r):
+    for h_col, d_col, a_col in ODDS_CANDIDATES:
+        if h_col not in r.index:
+            continue
+        try:
+            oh = float(r[h_col]); od = float(r[d_col]); oa = float(r[a_col])
+            if oh > 1.01 and od > 1.01 and oa > 1.01:
+                return oh, od, oa
+        except (TypeError, ValueError, KeyError):
+            continue
+    return None
+
 # ==================== CARGA ====================
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_from_football_data(liga_code, temporadas):
@@ -72,10 +102,10 @@ def load_from_football_data(liga_code, temporadas):
             d = d.dropna(subset=keep).copy()
             d['FTHG'] = d['FTHG'].astype(int)
             d['FTAG'] = d['FTAG'].astype(int)
-            for col in ['PSH','PSD','PSA','B365H','B365D','B365A']:
+            for col in ALL_ODDS_COLS:
                 if col not in d.columns:
                     d[col] = np.nan
-            dfs.append(d[keep + ['PSH','PSD','PSA','B365H','B365D','B365A']])
+            dfs.append(d[keep + ALL_ODDS_COLS])
         except Exception:
             fallos.append(t)
     if not dfs:
@@ -90,7 +120,7 @@ def load_from_upload(file):
     d = d.dropna(subset=keep).copy()
     d['FTHG'] = d['FTHG'].astype(int)
     d['FTAG'] = d['FTAG'].astype(int)
-    for col in ['PSH','PSD','PSA','B365H','B365D','B365A']:
+    for col in ALL_ODDS_COLS:
         if col not in d.columns:
             d[col] = np.nan
     return d.sort_values('Date').reset_index(drop=True)
@@ -183,22 +213,11 @@ def logloss_3way(p_h, p_d, p_a, outcome_idx):
     p = [p_h, p_d, p_a][outcome_idx]
     return -math.log(max(p, 1e-12))
 
-def get_odds_from_row(r):
-    for h, d, a in [('PSH','PSD','PSA'), ('B365H','B365D','B365A')]:
-        try:
-            oh, od, oa = float(r[h]), float(r[d]), float(r[o])
-            if oh > 1.01 and od > 1.01 and oa > 1.01:
-                return oh, od, oa
-        except Exception:
-            continue
-    return None
-
 def run_backtest(df, blend_w=0.5, sample_n=500, min_history=200, window=BACKTEST_WINDOW):
     df = df.sort_values('Date').reset_index(drop=True)
     n = len(df)
     start = max(min_history, n - sample_n)
-    
-    # ELO incremental (para cada partido, elo ANTES del partido)
+
     elo = {}
     elo_before = []
     for _, r in df.iterrows():
@@ -212,19 +231,18 @@ def run_backtest(df, blend_w=0.5, sample_n=500, min_history=200, window=BACKTEST
         delta = ELO_K * mult * (s_h - exp_h)
         elo[h] = eh + delta
         elo[a] = ea - delta
-    
+
     rows = []
     for i in range(start, n):
         r = df.iloc[i]
         train = df.iloc[max(0, i - window):i]
         if len(train) < 30:
             continue
-        
         atk, dfn, avg_h, avg_a = fit_strengths(train)
         lam_h, lam_a = predict_lambdas(atk, dfn, avg_h, avg_a, r['HomeTeam'], r['AwayTeam'])
         M = score_matrix(lam_h, lam_a)
         p_model = outcomes_from_matrix(M)
-        
+
         odds = get_odds_from_row(r)
         if odds:
             p_market = implied_probs(*odds)
@@ -232,13 +250,11 @@ def run_backtest(df, blend_w=0.5, sample_n=500, min_history=200, window=BACKTEST
         else:
             p_market = None
             p_final = p_model
-        
+
         outcome_idx = {'H': 0, 'D': 1, 'A': 2}[r['FTR']]
-        
         rows.append({
             'Date': r['Date'],
-            'HomeTeam': r['HomeTeam'],
-            'AwayTeam': r['AwayTeam'],
+            'HomeTeam': r['HomeTeam'], 'AwayTeam': r['AwayTeam'],
             'outcome': outcome_idx,
             'elo_h': elo_before[i][0], 'elo_a': elo_before[i][1],
             'p_model_H': p_model[0], 'p_model_D': p_model[1], 'p_model_A': p_model[2],
@@ -253,38 +269,36 @@ def run_backtest(df, blend_w=0.5, sample_n=500, min_history=200, window=BACKTEST
     return pd.DataFrame(rows)
 
 def metrics_table(bt):
-    """Calcula Brier y LogLoss para modelo, mercado, final, uniforme."""
     out = []
     # Modelo
-    br_m, ll_m, n_m = 0, 0, 0
-    for _, r in bt.iterrows():
-        br_m += brier_3way(r['p_model_H'], r['p_model_D'], r['p_model_A'], r['outcome'])
-        ll_m += logloss_3way(r['p_model_H'], r['p_model_D'], r['p_model_A'], r['outcome'])
-        n_m += 1
-    if n_m: out.append(('Modelo', n_m, br_m/n_m, ll_m/n_m))
-    
+    if len(bt):
+        br = sum(brier_3way(r['p_model_H'], r['p_model_D'], r['p_model_A'], r['outcome'])
+                 for _, r in bt.iterrows()) / len(bt)
+        ll = sum(logloss_3way(r['p_model_H'], r['p_model_D'], r['p_model_A'], r['outcome'])
+                 for _, r in bt.iterrows()) / len(bt)
+        out.append(('Modelo', len(bt), br, ll))
     # Mercado
     sub = bt.dropna(subset=['p_market_H'])
-    br_k, ll_k = 0, 0
-    for _, r in sub.iterrows():
-        br_k += brier_3way(r['p_market_H'], r['p_market_D'], r['p_market_A'], r['outcome'])
-        ll_k += logloss_3way(r['p_market_H'], r['p_market_D'], r['p_market_A'], r['outcome'])
-    if len(sub): out.append(('Mercado', len(sub), br_k/len(sub), ll_k/len(sub)))
-    
+    if len(sub):
+        br = sum(brier_3way(r['p_market_H'], r['p_market_D'], r['p_market_A'], r['outcome'])
+                 for _, r in sub.iterrows()) / len(sub)
+        ll = sum(logloss_3way(r['p_market_H'], r['p_market_D'], r['p_market_A'], r['outcome'])
+                 for _, r in sub.iterrows()) / len(sub)
+        out.append(('Mercado', len(sub), br, ll))
     # Final
-    br_f, ll_f = 0, 0
-    for _, r in bt.iterrows():
-        br_f += brier_3way(r['p_final_H'], r['p_final_D'], r['p_final_A'], r['outcome'])
-        ll_f += logloss_3way(r['p_final_H'], r['p_final_D'], r['p_final_A'], r['outcome'])
-    if len(bt): out.append(('Final', len(bt), br_f/len(bt), ll_f/len(bt)))
-    
+    if len(bt):
+        br = sum(brier_3way(r['p_final_H'], r['p_final_D'], r['p_final_A'], r['outcome'])
+                 for _, r in bt.iterrows()) / len(bt)
+        ll = sum(logloss_3way(r['p_final_H'], r['p_final_D'], r['p_final_A'], r['outcome'])
+                 for _, r in bt.iterrows()) / len(bt)
+        out.append(('Final', len(bt), br, ll))
     # Uniforme
-    br_u, ll_u = 0, 0
-    for _, r in bt.iterrows():
-        br_u += brier_3way(1/3, 1/3, 1/3, r['outcome'])
-        ll_u += logloss_3way(1/3, 1/3, 1/3, r['outcome'])
-    if len(bt): out.append(('Uniforme', len(bt), br_u/len(bt), ll_u/len(bt)))
-    
+    if len(bt):
+        br = sum(brier_3way(1/3, 1/3, 1/3, r['outcome'])
+                 for _, r in bt.iterrows()) / len(bt)
+        ll = sum(logloss_3way(1/3, 1/3, 1/3, r['outcome'])
+                 for _, r in bt.iterrows()) / len(bt)
+        out.append(('Uniforme', len(bt), br, ll))
     return pd.DataFrame(out, columns=['Fuente', 'N', 'Brier', 'LogLoss'])
 
 def simulate_betting(bt, bankroll=1000, edge_min=0.02, bet_filter='all',
@@ -294,13 +308,11 @@ def simulate_betting(bt, bankroll=1000, edge_min=0.02, bet_filter='all',
     n_bets = 0
     n_won = 0
     log = []
-    
     for _, r in bt.iterrows():
         if not (r['oh'] > 1.01 and r['od'] > 1.01 and r['oa'] > 1.01):
             continue
         probs = [r['p_final_H'], r['p_final_D'], r['p_final_A']]
         odds = [r['oh'], r['od'], r['oa']]
-        
         for k, tag in enumerate(['H', 'D', 'A']):
             if bet_filter != 'all' and tag != bet_filter:
                 continue
@@ -328,17 +340,12 @@ def simulate_betting(bt, bankroll=1000, edge_min=0.02, bet_filter='all',
                 'Ganó': 'SÍ' if won else 'NO',
                 'Bankroll': round(current, 2),
             })
-    
     roi = (current - bankroll) / total_staked if total_staked > 0 else 0
     return {
-        'bankroll_start': bankroll,
-        'bankroll_end': current,
-        'pnl': current - bankroll,
-        'n_bets': n_bets,
-        'n_won': n_won,
+        'bankroll_start': bankroll, 'bankroll_end': current,
+        'pnl': current - bankroll, 'n_bets': n_bets, 'n_won': n_won,
         'hit_rate': n_won / n_bets if n_bets else 0,
-        'total_staked': total_staked,
-        'roi': roi,
+        'total_staked': total_staked, 'roi': roi,
     }, pd.DataFrame(log)
 
 # ==================== UI ====================
@@ -424,15 +431,13 @@ with tab_pred:
 
         st.session_state.last_result = {
             'home': home, 'away': away, 'liga': liga_nombre,
-            'elo_home': elo.get(home, ELO_START),
-            'elo_away': elo.get(away, ELO_START),
+            'elo_home': elo.get(home, ELO_START), 'elo_away': elo.get(away, ELO_START),
             'n_home': n_h, 'n_away': n_a,
             'lam_h': lam_h, 'lam_a': lam_a,
             'p_model': p_model.tolist(),
             'p_market': p_market.tolist() if p_market is not None else None,
             'p_final': p_final.tolist(),
-            'extras': extras,
-            'odds': odds,
+            'extras': extras, 'odds': odds,
             'o_over': o_over if o_over and o_over > 1.01 else None,
             'o_under': o_under if o_under and o_under > 1.01 else None,
             'o_btts': o_btts if o_btts and o_btts > 1.01 else None,
@@ -485,6 +490,7 @@ with tab_pred:
             show("Mercado", pk)
         show("Final (blend)", pf)
 
+        # Gráfico SIN tooltips
         chart_df = pd.DataFrame({
             'Fuente': ['Modelo']*3 + ['Mercado']*3 + ['Final']*3,
             'Resultado': ['H', 'D', 'A'] * 3,
@@ -500,206 +506,4 @@ with tab_pred:
             color=alt.Color('Resultado:N', scale=alt.Scale(
                 domain=['H', 'D', 'A'],
                 range=['#5B8FF9', '#F6BD16', '#E8684A'])),
-            column=alt.Column('Fuente:N', header=alt.Header(
-                titleOrient='bottom', labelOrient='bottom')),
-            tooltip=['Fuente', 'Resultado', 'Probabilidad'],
-        ).properties(width=100, height=250)
-        st.altair_chart(chart, use_container_width=True)
-
-        if r['odds']:
-            st.markdown("**Stakes 1X2**")
-            c1, c2, c3 = st.columns(3)
-            for col, tag, p, o in zip([c1, c2, c3], ['H', 'D', 'A'], pf, r['odds']):
-                stake, edge = kelly_stake(p, o, r['bankroll'])
-                col.metric(f"{tag} @ {o:.2f}", f"${stake:.2f}", f"edge {edge*100:+.1f}%")
-            st.caption(f"Bankroll: ${r['bankroll']:.0f} · Kelly ¼ · cap 2%")
-
-        pairs = [
-            ('Over 2.5', r['extras']['over_2_5'], r.get('o_over')),
-            ('Under 2.5', r['extras']['under_2_5'], r.get('o_under')),
-            ('BTTS Sí', r['extras']['btts_yes'], r.get('o_btts')),
-        ]
-        active = [(tag, p, o) for tag, p, o in pairs if o]
-        if active:
-            st.markdown("**Stakes mercados extra**")
-            cols = st.columns(len(active))
-            for col, (tag, p, o) in zip(cols, active):
-                stake, edge = kelly_stake(p, o, r['bankroll'])
-                col.metric(f"{tag} @ {o:.2f}", f"${stake:.2f}", f"edge {edge*100:+.1f}%")
-
-        st.markdown("---")
-        st.markdown("**Mercados derivados**")
-        e = r['extras']
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Over 2.5", f"{e['over_2_5']*100:.1f}%")
-        c2.metric("Under 2.5", f"{e['under_2_5']*100:.1f}%")
-        c3.metric("BTTS Sí", f"{e['btts_yes']*100:.1f}%")
-
-        st.markdown("**Marcadores más probables**")
-        for sc, prob in e['top_scores']:
-            st.write(f"· **{sc}** → {prob*100:.1f}%")
-
-        st.success(f"💾 Guardada ({len(st.session_state.predicciones)} en total)")
-
-    if st.session_state.predicciones:
-        st.markdown("---")
-        st.subheader(f"📊 Historial ({len(st.session_state.predicciones)})")
-        hist_df = pd.DataFrame(st.session_state.predicciones)
-        st.dataframe(hist_df, use_container_width=True)
-        csv = hist_df.to_csv(index=False).encode('utf-8')
-        st.download_button("⬇️ Descargar CSV", data=csv,
-            file_name=f"predicciones_{datetime.now().strftime('%Y%m%d')}.csv",
-            mime='text/csv', use_container_width=True)
-        if st.button("🗑️ Borrar historial"):
-            st.session_state.predicciones = []
-            st.session_state.last_result = None
-            st.rerun()
-
-# ==================== TAB 2: BACKTEST ====================
-with tab_bt:
-    st.subheader("📊 Backtest honesto walk-forward")
-    st.caption("El modelo predice cada partido usando SOLO datos anteriores. "
-               "Se compara con el mercado y se simula apostar Kelly.")
-
-    c1, c2, c3 = st.columns(3)
-    sample_n = c1.number_input("Partidos a evaluar", 100, 5000, 500, 50)
-    bt_blend = c2.slider("Peso del modelo (blend)", 0.0, 1.0, 0.5, 0.05, key='bt_blend')
-    bt_bankroll = c3.number_input("Bankroll inicial", 10.0, 1e9, 1000.0, 100.0)
-
-    c1, c2, c3 = st.columns(3)
-    edge_min = c1.number_input("Edge mínimo", -0.10, 0.30, 0.02, 0.01)
-    bet_filter = c2.selectbox("Apostar solo a", ['all', 'H', 'D', 'A'])
-    min_hist = c3.number_input("Mín. historia (partidos)", 100, 5000, 200, 50)
-
-    st.info(f"⏱️ El backtest de {sample_n} partidos tarda ~30-90 segundos. "
-            f"Ventana de historia: {BACKTEST_WINDOW} partidos recientes.")
-
-    if st.button("▶️ Ejecutar backtest", use_container_width=True, type="primary"):
-        with st.spinner(f"Corriendo backtest sobre {sample_n} partidos..."):
-            bt = run_backtest(df, blend_w=bt_blend, sample_n=sample_n,
-                              min_history=min_hist)
-            if len(bt) == 0:
-                st.error("No hay suficientes partidos para backtestear.")
-            else:
-                mt = metrics_table(bt)
-                sim, log = simulate_betting(bt, bankroll=bt_bankroll,
-                                            edge_min=edge_min, bet_filter=bet_filter)
-                st.session_state.backtest_result = {
-                    'bt': bt, 'metrics': mt, 'sim': sim, 'log': log,
-                    'config': {'sample_n': sample_n, 'blend': bt_blend,
-                               'bankroll': bt_bankroll, 'edge_min': edge_min,
-                               'filter': bet_filter}
-                }
-
-    if st.session_state.backtest_result is not None:
-        res = st.session_state.backtest_result
-        bt = res['bt']
-        mt = res['metrics']
-        sim = res['sim']
-        log = res['log']
-        cfg = res['config']
-
-        st.markdown("---")
-        st.markdown(f"### Resultados · {len(bt)} partidos evaluados")
-        st.caption(f"{bt['Date'].min().date()} → {bt['Date'].max().date()} · "
-                   f"blend {cfg['blend']} · filtro {cfg['filter']}")
-
-        # Tabla de métricas
-        st.markdown("#### 📐 Métricas de calibración")
-        st.caption("**Brier** y **LogLoss**: menor = mejor. "
-                   "**Uniforme** = baseline trivial (1/3-1/3-1/3).")
-        mt_disp = mt.copy()
-        mt_disp['Brier'] = mt_disp['Brier'].round(4)
-        mt_disp['LogLoss'] = mt_disp['LogLoss'].round(4)
-        st.dataframe(mt_disp, use_container_width=True, hide_index=True)
-
-        # Diagnóstico
-        st.markdown("#### 🩺 Diagnóstico")
-        row_model = mt[mt['Fuente'] == 'Modelo'].iloc[0] if len(mt[mt['Fuente'] == 'Modelo']) else None
-        row_market = mt[mt['Fuente'] == 'Mercado'].iloc[0] if len(mt[mt['Fuente'] == 'Mercado']) else None
-        row_final = mt[mt['Fuente'] == 'Final'].iloc[0] if len(mt[mt['Fuente'] == 'Final']) else None
-        row_uni = mt[mt['Fuente'] == 'Uniforme'].iloc[0]
-
-        c1, c2, c3 = st.columns(3)
-        if row_model is not None:
-            delta_vs_uni = row_model['Brier'] - row_uni['Brier']
-            c1.metric("Brier modelo", f"{row_model['Brier']:.4f}",
-                      f"{delta_vs_uni:+.4f} vs uniforme",
-                      delta_color="inverse")
-        if row_market is not None:
-            c2.metric("Brier mercado", f"{row_market['Brier']:.4f}")
-        if row_final is not None:
-            delta_vs_mkt = row_final['Brier'] - (row_market['Brier'] if row_market is not None else 0)
-            c3.metric("Brier blend", f"{row_final['Brier']:.4f}",
-                      f"{delta_vs_mkt:+.4f} vs mercado",
-                      delta_color="inverse")
-
-        # Veredictos
-        veredictos = []
-        if row_model is not None and row_market is not None:
-            if row_model['Brier'] < row_market['Brier']:
-                veredictos.append("✅ El modelo bate al mercado en Brier")
-            else:
-                veredictos.append("❌ El modelo NO bate al mercado en Brier")
-        if row_final is not None and row_market is not None:
-            if row_final['Brier'] < row_market['Brier']:
-                veredictos.append("✅ El blend bate al mercado")
-            else:
-                veredictos.append("⚠️ El blend no mejora al mercado")
-        if row_model is not None and row_model['Brier'] < row_uni['Brier']:
-            veredictos.append("✅ El modelo es mejor que tirar 1/3-1/3-1/3")
-        else:
-            veredictos.append("❌ El modelo es igual o peor que el baseline trivial")
-        for v in veredictos:
-            st.write(v)
-
-        # Simulación de apuestas
-        st.markdown("---")
-        st.markdown("#### 💰 Simulación de apuestas (Kelly ¼, cap 2%)")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Apuestas", sim['n_bets'])
-        c2.metric("Ganadas", sim['n_won'], f"{sim['hit_rate']*100:.1f}% hit")
-        c3.metric("Bankroll final", f"${sim['bankroll_end']:.2f}",
-                  f"{sim['pnl']:+.2f}")
-        c4.metric("ROI", f"{sim['roi']*100:+.2f}%",
-                  f"${sim['total_staked']:.0f} staked")
-
-        if sim['n_bets'] == 0:
-            st.warning(f"No se generaron apuestas con edge ≥ {cfg['edge_min']*100:.1f}%. "
-                       "Prueba bajar el edge mínimo o cambiar el filtro.")
-        else:
-            # Curva de bankroll
-            if len(log) > 1:
-                log_chart = log.copy()
-                log_chart['idx'] = range(len(log_chart))
-                line = alt.Chart(log_chart).mark_line(color='#5B8FF9').encode(
-                    x=alt.X('idx:Q', title='Apuesta #'),
-                    y=alt.Y('Bankroll:Q', title='Bankroll ($)'),
-                ).properties(height=250)
-                st.altair_chart(line, use_container_width=True)
-
-            st.markdown("**Detalle de apuestas (últimas 30)**")
-            st.dataframe(log.tail(30), use_container_width=True, hide_index=True)
-
-            # Descargar log completo
-            csv_bt = log.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                "⬇️ Descargar log completo",
-                data=csv_bt,
-                file_name=f"backtest_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                mime='text/csv',
-                use_container_width=True,
-            )
-
-            # Veredicto final
-            st.markdown("---")
-            st.markdown("#### 🎯 Veredicto final")
-            if sim['roi'] > 0.05 and sim['n_bets'] >= 30:
-                st.success(f"✅ ROI positivo ({sim['roi']*100:+.1f}%) sobre "
-                           f"{sim['n_bets']} apuestas. Señal alentadora.")
-            elif sim['roi'] > 0:
-                st.warning(f"⚠️ ROI positivo débil ({sim['roi']*100:+.1f}%) "
-                           f"con solo {sim['n_bets']} apuestas. Muestra insuficiente.")
-            else:
-                st.error(f"❌ ROI negativo ({sim['roi']*100:+.1f}%). "
-                         f"El modelo no genera valor con esta configuración.")
+   
