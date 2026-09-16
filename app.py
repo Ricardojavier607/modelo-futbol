@@ -506,4 +506,211 @@ with tab_pred:
             color=alt.Color('Resultado:N', scale=alt.Scale(
                 domain=['H', 'D', 'A'],
                 range=['#5B8FF9', '#F6BD16', '#E8684A'])),
-   
+            column=alt.Column('Fuente:N', header=alt.Header(
+                titleOrient='bottom', labelOrient='bottom')),
+        ).properties(width=100, height=250)
+        st.altair_chart(chart, use_container_width=True)
+
+        if r['odds']:
+            st.markdown("**Stakes 1X2**")
+            c1, c2, c3 = st.columns(3)
+            for col, tag, p, o in zip([c1, c2, c3], ['H', 'D', 'A'], pf, r['odds']):
+                stake, edge = kelly_stake(p, o, r['bankroll'])
+                col.metric(f"{tag} @ {o:.2f}", f"${stake:.2f}", f"edge {edge*100:+.1f}%")
+            st.caption(f"Bankroll: ${r['bankroll']:.0f} · Kelly ¼ · cap 2%")
+
+        pairs = [
+            ('Over 2.5', r['extras']['over_2_5'], r.get('o_over')),
+            ('Under 2.5', r['extras']['under_2_5'], r.get('o_under')),
+            ('BTTS Sí', r['extras']['btts_yes'], r.get('o_btts')),
+        ]
+        active = [(tag, p, o) for tag, p, o in pairs if o]
+        if active:
+            st.markdown("**Stakes mercados extra**")
+            cols = st.columns(len(active))
+            for col, (tag, p, o) in zip(cols, active):
+                stake, edge = kelly_stake(p, o, r['bankroll'])
+                col.metric(f"{tag} @ {o:.2f}", f"${stake:.2f}", f"edge {edge*100:+.1f}%")
+
+        st.markdown("---")
+        st.markdown("**Mercados derivados**")
+        e = r['extras']
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Over 2.5", f"{e['over_2_5']*100:.1f}%")
+        c2.metric("Under 2.5", f"{e['under_2_5']*100:.1f}%")
+        c3.metric("BTTS Sí", f"{e['btts_yes']*100:.1f}%")
+
+        st.markdown("**Marcadores más probables**")
+        for sc, prob in e['top_scores']:
+            st.write(f"· **{sc}** → {prob*100:.1f}%")
+
+        st.success(f"💾 Guardada ({len(st.session_state.predicciones)} en total)")
+
+    if st.session_state.predicciones:
+        st.markdown("---")
+        st.subheader(f"📊 Historial ({len(st.session_state.predicciones)})")
+        hist_df = pd.DataFrame(st.session_state.predicciones)
+        st.dataframe(hist_df, use_container_width=True)
+        csv = hist_df.to_csv(index=False).encode('utf-8')
+        st.download_button("⬇️ Descargar CSV", data=csv,
+            file_name=f"predicciones_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime='text/csv', use_container_width=True)
+        if st.button("🗑️ Borrar historial"):
+            st.session_state.predicciones = []
+            st.session_state.last_result = None
+            st.rerun()
+
+# ==================== TAB 2: BACKTEST ====================
+with tab_bt:
+    st.subheader("📊 Backtest honesto walk-forward")
+    st.caption("El modelo predice cada partido usando SOLO datos anteriores. "
+               "Se compara con el mercado y se simula apostar Kelly.")
+
+    # Diagnóstico de cuotas
+    with st.expander("🔍 Diagnóstico de columnas de cuotas"):
+        odds_cols_check = [c for c in df.columns if any(
+            c.startswith(p) for p in ['PS','B365','WH','IW','VC','BW'])]
+        st.write("Columnas de cuotas presentes en el dataset:", odds_cols_check)
+        sample = df.tail(500)
+        n_valid = sum(1 for _, row in sample.iterrows()
+                      if get_odds_from_row(row) is not None)
+        st.write(f"Partidos con cuotas válidas en últimos 500: **{n_valid}**")
+        if n_valid > 0:
+            st.success(f"✅ Se usarán {n_valid} partidos con cuotas para el backtest.")
+        else:
+            st.error("❌ No hay cuotas válidas. El backtest solo evaluará el modelo puro.")
+
+    c1, c2, c3 = st.columns(3)
+    sample_n = c1.number_input("Partidos a evaluar", 100, 5000, 500, 50)
+    bt_blend = c2.slider("Peso del modelo (blend)", 0.0, 1.0, 0.5, 0.05, key='bt_blend')
+    bt_bankroll = c3.number_input("Bankroll inicial", 10.0, 1e9, 1000.0, 100.0)
+
+    c1, c2, c3 = st.columns(3)
+    edge_min = c1.number_input("Edge mínimo", -0.10, 0.30, 0.02, 0.01)
+    bet_filter = c2.selectbox("Apostar solo a", ['all', 'H', 'D', 'A'])
+    min_hist = c3.number_input("Mín. historia (partidos)", 100, 5000, 200, 50)
+
+    st.info(f"⏱️ El backtest de {sample_n} partidos tarda ~30-90 segundos.")
+
+    if st.button("▶️ Ejecutar backtest", use_container_width=True, type="primary"):
+        with st.spinner(f"Corriendo backtest sobre {sample_n} partidos..."):
+            bt = run_backtest(df, blend_w=bt_blend, sample_n=sample_n,
+                              min_history=min_hist)
+            if len(bt) == 0:
+                st.error("No hay suficientes partidos para backtestear.")
+            else:
+                mt = metrics_table(bt)
+                sim, log = simulate_betting(bt, bankroll=bt_bankroll,
+                                            edge_min=edge_min, bet_filter=bet_filter)
+                st.session_state.backtest_result = {
+                    'bt': bt, 'metrics': mt, 'sim': sim, 'log': log,
+                    'config': {'sample_n': sample_n, 'blend': bt_blend,
+                               'bankroll': bt_bankroll, 'edge_min': edge_min,
+                               'filter': bet_filter}
+                }
+
+    if st.session_state.backtest_result is not None:
+        res = st.session_state.backtest_result
+        bt = res['bt']; mt = res['metrics']; sim = res['sim']; log = res['log']
+        cfg = res['config']
+
+        st.markdown("---")
+        st.markdown(f"### Resultados · {len(bt)} partidos evaluados")
+        st.caption(f"{bt['Date'].min().date()} → {bt['Date'].max().date()} · "
+                   f"blend {cfg['blend']} · filtro {cfg['filter']}")
+
+        st.markdown("#### 📐 Métricas de calibración")
+        mt_disp = mt.copy()
+        mt_disp['Brier'] = mt_disp['Brier'].round(4)
+        mt_disp['LogLoss'] = mt_disp['LogLoss'].round(4)
+        st.dataframe(mt_disp, use_container_width=True, hide_index=True)
+
+        st.markdown("#### 🩺 Diagnóstico")
+        def get_row(name):
+            s = mt[mt['Fuente'] == name]
+            return s.iloc[0] if len(s) else None
+
+        row_model = get_row('Modelo')
+        row_market = get_row('Mercado')
+        row_final = get_row('Final')
+        row_uni = get_row('Uniforme')
+
+        c1, c2, c3 = st.columns(3)
+        if row_model is not None and row_uni is not None:
+            delta = row_model['Brier'] - row_uni['Brier']
+            c1.metric("Brier modelo", f"{row_model['Brier']:.4f}",
+                      f"{delta:+.4f} vs uniforme", delta_color="inverse")
+        if row_market is not None:
+            c2.metric("Brier mercado", f"{row_market['Brier']:.4f}")
+        if row_final is not None and row_market is not None:
+            delta = row_final['Brier'] - row_market['Brier']
+            c3.metric("Brier blend", f"{row_final['Brier']:.4f}",
+                      f"{delta:+.4f} vs mercado", delta_color="inverse")
+
+        # Veredictos seguros (sin comparar contra filas inexistentes)
+        if row_market is None:
+            st.warning("⚠️ No hay cuotas válidas para comparar con el mercado. "
+                       "El backtest solo evalúa el modelo puro.")
+        else:
+            if row_model is not None:
+                if row_model['Brier'] < row_market['Brier']:
+                    st.write("✅ El modelo bate al mercado en Brier")
+                else:
+                    st.write("❌ El modelo NO bate al mercado en Brier")
+            if row_final is not None:
+                if row_final['Brier'] < row_market['Brier']:
+                    st.write("✅ El blend bate al mercado")
+                else:
+                    st.write("⚠️ El blend no mejora al mercado")
+
+        if row_model is not None and row_uni is not None:
+            if row_model['Brier'] < row_uni['Brier']:
+                st.write("✅ El modelo es mejor que tirar 1/3-1/3-1/3")
+            else:
+                st.write("❌ El modelo es igual o peor que el baseline trivial")
+
+        st.markdown("---")
+        st.markdown("#### 💰 Simulación de apuestas (Kelly ¼, cap 2%)")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Apuestas", sim['n_bets'])
+        c2.metric("Ganadas", sim['n_won'], f"{sim['hit_rate']*100:.1f}% hit")
+        c3.metric("Bankroll final", f"${sim['bankroll_end']:.2f}",
+                  f"{sim['pnl']:+.2f}")
+        c4.metric("ROI", f"{sim['roi']*100:+.2f}%",
+                  f"${sim['total_staked']:.0f} staked")
+
+        if sim['n_bets'] == 0:
+            st.warning(f"No se generaron apuestas con edge ≥ {cfg['edge_min']*100:.1f}%. "
+                       "Prueba bajar el edge mínimo o cambiar el filtro.")
+        else:
+            if len(log) > 1:
+                log_chart = log.copy()
+                log_chart['idx'] = range(len(log_chart))
+                line = alt.Chart(log_chart).mark_line(color='#5B8FF9').encode(
+                    x=alt.X('idx:Q', title='Apuesta #'),
+                    y=alt.Y('Bankroll:Q', title='Bankroll ($)'),
+                ).properties(height=250)
+                st.altair_chart(line, use_container_width=True)
+
+            st.markdown("**Detalle de apuestas (últimas 30)**")
+            st.dataframe(log.tail(30), use_container_width=True, hide_index=True)
+
+            csv_bt = log.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                "⬇️ Descargar log completo",
+                data=csv_bt,
+                file_name=f"backtest_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime='text/csv',
+                use_container_width=True,
+            )
+
+            st.markdown("---")
+            st.markdown("#### 🎯 Veredicto final")
+            if sim['roi'] > 0.05 and sim['n_bets'] >= 30:
+                st.success(f"✅ ROI positivo ({sim['roi']*100:+.1f}%) sobre "
+                           f"{sim['n_bets']} apuestas.")
+            elif sim['roi'] > 0:
+                st.warning(f"⚠️ ROI positivo débil ({sim['roi']*100:+.1f}%) "
+                           f"con {sim['n_bets']} apuestas.")
+            else:
+                st.error(f"❌ ROI negativo ({sim['roi']*100:+.1f}%).")
