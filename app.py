@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import math
-from io import StringIO
+from datetime import datetime
 from scipy.stats import poisson
 
 st.set_page_config(page_title="Modelo Futbol", page_icon="⚽", layout="centered")
@@ -11,6 +11,7 @@ st.set_page_config(page_title="Modelo Futbol", page_icon="⚽", layout="centered
 ELO_K, ELO_HOME_ADV, ELO_START = 20, 65, 1500
 HALF_LIFE_DAYS, RHO_DC, MAX_GOALS = 180, -0.10, 10
 KELLY_FRACTION, MAX_STAKE_FRAC = 0.25, 0.02
+MIN_MATCHES_WARN = 5
 
 FB_BASE = "https://www.football-data.co.uk/mmz4281"
 TEMPORADAS_DEFAULT = ['2425', '2324', '2223', '2122', '2021']
@@ -30,34 +31,44 @@ LIGAS = {
     'MLS': 'USA',
 }
 
+# ==================== SESSION ====================
+if 'predicciones' not in st.session_state:
+    st.session_state.predicciones = []
+if 'last_result' not in st.session_state:
+    st.session_state.last_result = None
+
 # ==================== UTILS ====================
 def implied_probs(oh, od, oa):
     inv = np.array([1/oh, 1/od, 1/oa])
     return inv / inv.sum()
 
-# ==================== CARGA MULTI-TEMPORADA ====================
+def kelly_stake(p, o, bankroll):
+    b = o - 1
+    edge = p * o - 1
+    if edge <= 0:
+        return 0.0, edge
+    kelly = (b * p - (1 - p)) / b
+    stake = min(bankroll * kelly * KELLY_FRACTION, bankroll * MAX_STAKE_FRAC)
+    return max(0.0, stake), edge
+
+# ==================== CARGA ====================
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_from_football_data(liga_code, temporadas):
-    """Descarga CSV de football-data y une varias temporadas."""
-    dfs = []
-    fallos = []
+    dfs, fallos = [], []
     for t in temporadas:
         url = f"{FB_BASE}/{t}/{liga_code}.csv"
         try:
             d = pd.read_csv(url, encoding='latin-1')
             if 'Date' not in d.columns or 'HomeTeam' not in d.columns:
-                fallos.append(t)
-                continue
+                fallos.append(t); continue
             d['Date'] = pd.to_datetime(d['Date'], dayfirst=True, errors='coerce')
             keep = ['Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'FTR']
             if not all(c in d.columns for c in keep):
-                fallos.append(t)
-                continue
+                fallos.append(t); continue
             d = d.dropna(subset=keep).copy()
             d['FTHG'] = d['FTHG'].astype(int)
             d['FTAG'] = d['FTAG'].astype(int)
-            # Cuotas: preferir Pinnacle, luego Bet365
-            for col in ['PSH', 'PSD', 'PSA', 'B365H', 'B365D', 'B365A']:
+            for col in ['PSH','PSD','PSA','B365H','B365D','B365A']:
                 if col not in d.columns:
                     d[col] = np.nan
             dfs.append(d[keep + ['PSH','PSD','PSA','B365H','B365D','B365A']])
@@ -66,8 +77,7 @@ def load_from_football_data(liga_code, temporadas):
     if not dfs:
         return None, fallos
     out = pd.concat(dfs, ignore_index=True)
-    out = out.sort_values('Date').reset_index(drop=True)
-    return out, fallos
+    return out.sort_values('Date').reset_index(drop=True), fallos
 
 def load_from_upload(file):
     d = pd.read_csv(file, encoding='latin-1')
@@ -96,10 +106,11 @@ def compute_elo(df):
         elo[a] = ea - delta
     return elo
 
-def fit_strengths(df, as_of, half_life=HALF_LIFE_DAYS):
-    d = df[df['Date'] < as_of].copy()
-    if len(d) < 30:
+def fit_strengths(df, half_life=HALF_LIFE_DAYS):
+    if len(df) < 30:
         return {}, {}, 1.3, 1.3
+    as_of = df['Date'].max() + pd.Timedelta(days=1)
+    d = df.copy()
     days = (as_of - d['Date']).dt.days.clip(lower=0)
     w = np.exp(-math.log(2) * days / half_life).values
     d = d.assign(w=w)
@@ -139,53 +150,42 @@ def outcomes_from_matrix(M):
     pD = sum(M[i,i] for i in range(n))
     return np.array([pH, pD, 1 - pH - pD])
 
-def get_market_odds(row):
-    for h, d, a in [('PSH','PSD','PSA'), ('B365H','B365D','B365A')]:
-        try:
-            oh, od, oa = float(row[h]), float(row[d]), float(row[a])
-            if oh > 1.01 and od > 1.01 and oa > 1.01:
-                return oh, od, oa
-        except Exception:
-            continue
-    return None
+def extra_markets(M):
+    n = M.shape[0]
+    over25 = sum(M[i,j] for i in range(n) for j in range(n) if i + j > 2)
+    btts = sum(M[i,j] for i in range(1, n) for j in range(1, n))
+    scores = [(f"{i}-{j}", M[i,j]) for i in range(min(5, n)) for j in range(min(5, n))]
+    scores.sort(key=lambda x: -x[1])
+    return {'over_2_5': over25, 'under_2_5': 1-over25,
+            'btts_yes': btts, 'btts_no': 1-btts,
+            'top_scores': scores[:5]}
 
 # ==================== UI ====================
 st.title("⚽ Predictor de Futbol")
 st.caption("Poisson + Dixon-Coles + ELO + cuotas + Kelly ¼ · Multi-temporada")
 
-# --- Sidebar: fuente de datos ---
 st.sidebar.header("Datos")
-
-modo = st.sidebar.radio(
-    "Fuente de datos",
-    ["Automático (football-data.co.uk)", "Subir CSV manualmente"],
-)
+modo = st.sidebar.radio("Fuente de datos",
+    ["Automático (football-data.co.uk)", "Subir CSV manualmente"])
 
 df = None
+liga_nombre = "Manual"
 
 if modo == "Automático (football-data.co.uk)":
     liga_nombre = st.sidebar.selectbox("Liga", list(LIGAS.keys()), index=0)
     liga_code = LIGAS[liga_nombre]
-
-    temporadas_str = st.sidebar.text_input(
-        "Temporadas (separadas por coma)",
-        value=", ".join(TEMPORADAS_DEFAULT),
-        help="Formato YYZZ. Ej: 2425 = 2024/25"
-    )
+    temporadas_str = st.sidebar.text_input("Temporadas (separadas por coma)",
+        value=", ".join(TEMPORADAS_DEFAULT))
     temporadas = [t.strip() for t in temporadas_str.split(",") if t.strip()]
-
     with st.spinner(f"Cargando {liga_nombre}..."):
         df, fallos = load_from_football_data(liga_code, temporadas)
-
     if df is None:
         st.error("No se pudieron descargar datos. Prueba subir CSV manual.")
         st.stop()
-
     st.success(f"✅ {liga_nombre} · {len(df)} partidos · "
                f"{df['Date'].min().date()} → {df['Date'].max().date()}")
     if fallos:
         st.warning(f"Temporadas no disponibles: {', '.join(fallos)}")
-
 else:
     uploaded = st.sidebar.file_uploader("Sube CSV de football-data", type="csv")
     if uploaded is None:
@@ -195,13 +195,9 @@ else:
     st.success(f"✅ {len(df)} partidos · "
                f"{df['Date'].min().date()} → {df['Date'].max().date()}")
 
-# --- Equipos ---
 teams = sorted(set(df['HomeTeam']).union(df['AwayTeam']))
 home = st.selectbox("Equipo local", teams, index=0)
 away = st.selectbox("Equipo visitante", [t for t in teams if t != home], index=0)
-
-# --- Cuotas: auto-rellenar con última del CSV, editable ---
-last = df.dropna(subset=['Date']).iloc[-1] if len(df) else None
 
 auto = st.toggle("Usar cuotas del mercado", value=True)
 odds = None
@@ -213,16 +209,15 @@ if auto:
     odds = (oh, od, oa)
 
 bankroll = st.number_input("Bankroll", 1.0, 1e9, 1000.0, 10.0)
-blend = st.slider("Peso del modelo en el blend", 0.0, 1.0, 0.5, 0.05,
-                  help="0 = solo mercado · 1 = solo modelo")
+blend = st.slider("Peso del modelo en el blend", 0.0, 1.0, 0.5, 0.05)
 
-# --- Predicción ---
 if st.button("🔮 Predecir", use_container_width=True, type="primary"):
     elo = compute_elo(df)
-    as_of = df['Date'].max() + pd.Timedelta(days=1)
-    atk, dfn, avg_h, avg_a = fit_strengths(df, as_of)
+    atk, dfn, avg_h, avg_a = fit_strengths(df)
     lam_h, lam_a = predict_lambdas(atk, dfn, avg_h, avg_a, home, away)
-    p_model = outcomes_from_matrix(score_matrix(lam_h, lam_a))
+    M = score_matrix(lam_h, lam_a)
+    p_model = outcomes_from_matrix(M)
+    extras = extra_markets(M)
 
     if odds:
         p_market = implied_probs(*odds)
@@ -230,37 +225,121 @@ if st.button("🔮 Predecir", use_container_width=True, type="primary"):
     else:
         p_market, p_final = None, p_model
 
-    st.subheader(f"{home} vs {away}")
-    c1, c2 = st.columns(2)
-    c1.metric("ELO local", f"{elo.get(home, ELO_START):.0f}")
-    c2.metric("ELO visitante", f"{elo.get(away, ELO_START):.0f}")
-    c1.metric("λ local", f"{lam_h:.2f}")
-    c2.metric("λ visitante", f"{lam_a:.2f}")
+    n_h = int(((df['HomeTeam'] == home) | (df['AwayTeam'] == home)).sum())
+    n_a = int(((df['HomeTeam'] == away) | (df['AwayTeam'] == away)).sum())
 
-    def show_probs(label, p):
+    st.session_state.last_result = {
+        'home': home, 'away': away, 'liga': liga_nombre,
+        'elo_home': elo.get(home, ELO_START),
+        'elo_away': elo.get(away, ELO_START),
+        'n_home': n_h, 'n_away': n_a,
+        'lam_h': lam_h, 'lam_a': lam_a,
+        'p_model': p_model.tolist(),
+        'p_market': p_market.tolist() if p_market is not None else None,
+        'p_final': p_final.tolist(),
+        'extras': extras,
+        'odds': odds, 'bankroll': bankroll,
+    }
+
+    # Guardar en historial
+    rec = {
+        'fecha': datetime.now().strftime('%Y-%m-%d %H:%M'),
+        'liga': liga_nombre, 'local': home, 'visitante': away,
+        'elo_local': round(elo.get(home, ELO_START), 1),
+        'elo_visit': round(elo.get(away, ELO_START), 1),
+        'lam_local': round(lam_h, 2), 'lam_visit': round(lam_a, 2),
+        'p_mod_H': round(p_model[0]*100, 1),
+        'p_mod_D': round(p_model[1]*100, 1),
+        'p_mod_A': round(p_model[2]*100, 1),
+        'p_fin_H': round(p_final[0]*100, 1),
+        'p_fin_D': round(p_final[1]*100, 1),
+        'p_fin_A': round(p_final[2]*100, 1),
+        'over25': round(extras['over_2_5']*100, 1),
+        'btts': round(extras['btts_yes']*100, 1),
+    }
+    if odds:
+        rec.update({'cuota_H': oh, 'cuota_D': od, 'cuota_A': oa})
+    st.session_state.predicciones.append(rec)
+
+# ==================== MOSTRAR RESULTADO ====================
+if st.session_state.last_result is not None:
+    r = st.session_state.last_result
+    st.subheader(f"{r['home']} vs {r['away']}")
+
+    if r['n_home'] < MIN_MATCHES_WARN or r['n_away'] < MIN_MATCHES_WARN:
+        st.warning(f"⚠️ Pocos datos: {r['home']} {r['n_home']} partidos · "
+                   f"{r['away']} {r['n_away']} partidos. Predicción poco fiable.")
+
+    c1, c2 = st.columns(2)
+    c1.metric("ELO local", f"{r['elo_home']:.0f}", f"{r['n_home']} partidos")
+    c2.metric("ELO visitante", f"{r['elo_away']:.0f}", f"{r['n_away']} partidos")
+    c1.metric("λ local", f"{r['lam_h']:.2f}")
+    c2.metric("λ visitante", f"{r['lam_a']:.2f}")
+
+    pm = r['p_model']; pk = r['p_market']; pf = r['p_final']
+
+    def show(label, p):
         st.markdown(f"**{label}**")
         c1, c2, c3 = st.columns(3)
         c1.metric("H", f"{p[0]*100:.1f}%")
         c2.metric("D", f"{p[1]*100:.1f}%")
         c3.metric("A", f"{p[2]*100:.1f}%")
 
-    show_probs("Modelo (Poisson+ELO)", p_model)
-    if p_market is not None:
-        show_probs("Mercado (sin overround)", p_market)
-    show_probs("Final (blend)", p_final)
+    show("Modelo (Poisson+ELO)", pm)
+    if pk is not None:
+        show("Mercado (sin overround)", pk)
+    show("Final (blend)", pf)
 
-    if odds:
-        st.markdown("**Stakes (Kelly ¼, cap 2%)**")
+    # Gráfico
+    chart_data = pd.DataFrame(
+        {'H': [pm[0], pk[0] if pk else 0, pf[0]],
+         'D': [pm[1], pk[1] if pk else 0, pf[1]],
+         'A': [pm[2], pk[2] if pk else 0, pf[2]]},
+        index=['Modelo', 'Mercado', 'Final'])
+    st.bar_chart(chart_data)
+
+    # Stakes 1X2
+    if r['odds']:
+        st.markdown("**Stakes 1X2 (Kelly ¼, cap 2%)**")
         c1, c2, c3 = st.columns(3)
-        for col, tag, p, o in zip([c1, c2, c3], ['H', 'D', 'A'], p_final, odds):
-            b = o - 1
-            edge = p * o - 1
-            if edge <= 0:
-                col.metric(f"{tag} @ {o:.2f}", "$0", f"edge {edge*100:+.1f}%")
-                continue
-            kelly = (b * p - (1 - p)) / b
-            stake = min(bankroll * kelly * KELLY_FRACTION,
-                        bankroll * MAX_STAKE_FRAC)
+        for col, tag, p, o in zip([c1,c2,c3], ['H','D','A'], pf, r['odds']):
+            stake, edge = kelly_stake(p, o, r['bankroll'])
             col.metric(f"{tag} @ {o:.2f}", f"${stake:.2f}",
                        f"edge {edge*100:+.1f}%")
-        st.caption(f"Bankroll: ${bankroll:.0f} · Kelly ¼ · cap 2% por apuesta")
+        st.caption(f"Bankroll: ${r['bankroll']:.0f} · Kelly ¼ · cap 2%")
+
+    # Mercados extra
+    st.markdown("---")
+    st.markdown("**Mercados derivados (solo modelo)**")
+    e = r['extras']
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Over 2.5", f"{e['over_2_5']*100:.1f}%")
+    c2.metric("Under 2.5", f"{e['under_2_5']*100:.1f}%")
+    c3.metric("BTTS Sí", f"{e['btts_yes']*100:.1f}%")
+
+    st.markdown("**Marcadores más probables**")
+    for sc, prob in e['top_scores']:
+        st.write(f"· **{sc}** → {prob*100:.1f}%")
+
+    st.success(f"💾 Predicción guardada ({len(st.session_state.predicciones)} en total)")
+
+# ==================== HISTORIAL ====================
+if st.session_state.predicciones:
+    st.markdown("---")
+    st.subheader(f"📊 Historial ({len(st.session_state.predicciones)})")
+    hist_df = pd.DataFrame(st.session_state.predicciones)
+    st.dataframe(hist_df, use_container_width=True)
+
+    csv = hist_df.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        "⬇️ Descargar historial CSV",
+        data=csv,
+        file_name=f"predicciones_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+        mime='text/csv',
+        use_container_width=True,
+    )
+
+    if st.button("🗑️ Borrar historial"):
+        st.session_state.predicciones = []
+        st.session_state.last_result = None
+        st.rerun()
