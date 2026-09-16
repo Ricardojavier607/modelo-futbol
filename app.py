@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import math
+import altair as alt
 from datetime import datetime
 from scipy.stats import poisson
 
@@ -154,11 +155,20 @@ def extra_markets(M):
     n = M.shape[0]
     over25 = sum(M[i,j] for i in range(n) for j in range(n) if i + j > 2)
     btts = sum(M[i,j] for i in range(1, n) for j in range(1, n))
-    scores = [(f"{i}-{j}", M[i,j]) for i in range(min(5, n)) for j in range(min(5, n))]
-    scores.sort(key=lambda x: -x[1])
-    return {'over_2_5': over25, 'under_2_5': 1-over25,
-            'btts_yes': btts, 'btts_no': 1-btts,
-            'top_scores': scores[:5]}
+    all_scores = [(f"{i}-{j}", float(M[i,j]))
+                  for i in range(min(5, n)) for j in range(min(5, n))]
+    all_scores.sort(key=lambda x: -x[1])
+    seen, top = set(), []
+    for sc, p in all_scores:
+        if sc in seen:
+            continue
+        seen.add(sc)
+        top.append((sc, p))
+        if len(top) == 5:
+            break
+    return {'over_2_5': over25, 'under_2_5': 1 - over25,
+            'btts_yes': btts, 'btts_no': 1 - btts,
+            'top_scores': top}
 
 # ==================== UI ====================
 st.title("⚽ Predictor de Futbol")
@@ -174,7 +184,8 @@ liga_nombre = "Manual"
 if modo == "Automático (football-data.co.uk)":
     liga_nombre = st.sidebar.selectbox("Liga", list(LIGAS.keys()), index=0)
     liga_code = LIGAS[liga_nombre]
-    temporadas_str = st.sidebar.text_input("Temporadas (separadas por coma)",
+    temporadas_str = st.sidebar.text_input(
+        "Temporadas (separadas por coma)",
         value=", ".join(TEMPORADAS_DEFAULT))
     temporadas = [t.strip() for t in temporadas_str.split(",") if t.strip()]
     with st.spinner(f"Cargando {liga_nombre}..."):
@@ -201,12 +212,21 @@ away = st.selectbox("Equipo visitante", [t for t in teams if t != home], index=0
 
 auto = st.toggle("Usar cuotas del mercado", value=True)
 odds = None
+o_over = o_under = o_btts = None
+
 if auto:
+    st.markdown("**Cuotas 1X2**")
     c1, c2, c3 = st.columns(3)
     oh = c1.number_input("Cuota H", 1.01, 100.0, 2.00, 0.01)
     od = c2.number_input("Cuota D", 1.01, 100.0, 3.30, 0.01)
     oa = c3.number_input("Cuota A", 1.01, 100.0, 3.50, 0.01)
     odds = (oh, od, oa)
+
+    st.markdown("**Cuotas mercados extra (opcional, 0 = no usar)**")
+    c1, c2, c3 = st.columns(3)
+    o_over = c1.number_input("Over 2.5", 0.0, 100.0, 0.0, 0.05)
+    o_under = c2.number_input("Under 2.5", 0.0, 100.0, 0.0, 0.05)
+    o_btts = c3.number_input("BTTS Sí", 0.0, 100.0, 0.0, 0.05)
 
 bankroll = st.number_input("Bankroll", 1.0, 1e9, 1000.0, 10.0)
 blend = st.slider("Peso del modelo en el blend", 0.0, 1.0, 0.5, 0.05)
@@ -238,37 +258,40 @@ if st.button("🔮 Predecir", use_container_width=True, type="primary"):
         'p_market': p_market.tolist() if p_market is not None else None,
         'p_final': p_final.tolist(),
         'extras': extras,
-        'odds': odds, 'bankroll': bankroll,
+        'odds': odds,
+        'o_over': o_over if o_over and o_over > 1.01 else None,
+        'o_under': o_under if o_under and o_under > 1.01 else None,
+        'o_btts': o_btts if o_btts and o_btts > 1.01 else None,
+        'bankroll': bankroll,
     }
 
-    # Guardar en historial
     rec = {
         'fecha': datetime.now().strftime('%Y-%m-%d %H:%M'),
         'liga': liga_nombre, 'local': home, 'visitante': away,
         'elo_local': round(elo.get(home, ELO_START), 1),
         'elo_visit': round(elo.get(away, ELO_START), 1),
         'lam_local': round(lam_h, 2), 'lam_visit': round(lam_a, 2),
-        'p_mod_H': round(p_model[0]*100, 1),
-        'p_mod_D': round(p_model[1]*100, 1),
-        'p_mod_A': round(p_model[2]*100, 1),
-        'p_fin_H': round(p_final[0]*100, 1),
-        'p_fin_D': round(p_final[1]*100, 1),
-        'p_fin_A': round(p_final[2]*100, 1),
-        'over25': round(extras['over_2_5']*100, 1),
-        'btts': round(extras['btts_yes']*100, 1),
+        'p_mod_H': round(p_model[0] * 100, 1),
+        'p_mod_D': round(p_model[1] * 100, 1),
+        'p_mod_A': round(p_model[2] * 100, 1),
+        'p_fin_H': round(p_final[0] * 100, 1),
+        'p_fin_D': round(p_final[1] * 100, 1),
+        'p_fin_A': round(p_final[2] * 100, 1),
+        'over25': round(extras['over_2_5'] * 100, 1),
+        'btts': round(extras['btts_yes'] * 100, 1),
     }
     if odds:
         rec.update({'cuota_H': oh, 'cuota_D': od, 'cuota_A': oa})
     st.session_state.predicciones.append(rec)
 
-# ==================== MOSTRAR RESULTADO ====================
+# ==================== RESULTADO ====================
 if st.session_state.last_result is not None:
     r = st.session_state.last_result
     st.subheader(f"{r['home']} vs {r['away']}")
 
     if r['n_home'] < MIN_MATCHES_WARN or r['n_away'] < MIN_MATCHES_WARN:
         st.warning(f"⚠️ Pocos datos: {r['home']} {r['n_home']} partidos · "
-                   f"{r['away']} {r['n_away']} partidos. Predicción poco fiable.")
+                   f"{r['away']} {r['n_away']} partidos. Poco fiable.")
 
     c1, c2 = st.columns(2)
     c1.metric("ELO local", f"{r['elo_home']:.0f}", f"{r['n_home']} partidos")
@@ -276,7 +299,7 @@ if st.session_state.last_result is not None:
     c1.metric("λ local", f"{r['lam_h']:.2f}")
     c2.metric("λ visitante", f"{r['lam_a']:.2f}")
 
-    pm = r['p_model']; pk = r['p_market']; pf = r['p_final']
+    pm, pk, pf = r['p_model'], r['p_market'], r['p_final']
 
     def show(label, p):
         st.markdown(f"**{label}**")
@@ -290,25 +313,54 @@ if st.session_state.last_result is not None:
         show("Mercado (sin overround)", pk)
     show("Final (blend)", pf)
 
-    # Gráfico
-    chart_data = pd.DataFrame(
-        {'H': [pm[0], pk[0] if pk else 0, pf[0]],
-         'D': [pm[1], pk[1] if pk else 0, pf[1]],
-         'A': [pm[2], pk[2] if pk else 0, pf[2]]},
-        index=['Modelo', 'Mercado', 'Final'])
-    st.bar_chart(chart_data)
+    # Gráfico Altair
+    chart_df = pd.DataFrame({
+        'Fuente': ['Modelo']*3 + ['Mercado']*3 + ['Final']*3,
+        'Resultado': ['H', 'D', 'A'] * 3,
+        'Probabilidad': [
+            pm[0]*100, pm[1]*100, pm[2]*100,
+            (pk[0]*100 if pk else 0), (pk[1]*100 if pk else 0), (pk[2]*100 if pk else 0),
+            pf[0]*100, pf[1]*100, pf[2]*100,
+        ],
+    })
+    chart = alt.Chart(chart_df).mark_bar().encode(
+        x=alt.X('Resultado:N', axis=alt.Axis(labelAngle=0), title=None),
+        y=alt.Y('Probabilidad:Q', title='Probabilidad (%)'),
+        color=alt.Color('Resultado:N', scale=alt.Scale(
+            domain=['H', 'D', 'A'],
+            range=['#5B8FF9', '#F6BD16', '#E8684A'])),
+        column=alt.Column('Fuente:N', header=alt.Header(
+            titleOrient='bottom', labelOrient='bottom')),
+        tooltip=['Fuente', 'Resultado', 'Probabilidad'],
+    ).properties(width=100, height=250)
+    st.altair_chart(chart, use_container_width=True)
 
     # Stakes 1X2
     if r['odds']:
         st.markdown("**Stakes 1X2 (Kelly ¼, cap 2%)**")
         c1, c2, c3 = st.columns(3)
-        for col, tag, p, o in zip([c1,c2,c3], ['H','D','A'], pf, r['odds']):
+        for col, tag, p, o in zip([c1, c2, c3], ['H', 'D', 'A'], pf, r['odds']):
             stake, edge = kelly_stake(p, o, r['bankroll'])
             col.metric(f"{tag} @ {o:.2f}", f"${stake:.2f}",
                        f"edge {edge*100:+.1f}%")
         st.caption(f"Bankroll: ${r['bankroll']:.0f} · Kelly ¼ · cap 2%")
 
-    # Mercados extra
+    # Stakes mercados extra
+    pairs = [
+        ('Over 2.5', r['extras']['over_2_5'], r.get('o_over')),
+        ('Under 2.5', r['extras']['under_2_5'], r.get('o_under')),
+        ('BTTS Sí', r['extras']['btts_yes'], r.get('o_btts')),
+    ]
+    active_pairs = [(tag, p, o) for tag, p, o in pairs if o]
+    if active_pairs:
+        st.markdown("**Stakes mercados extra**")
+        cols = st.columns(len(active_pairs))
+        for col, (tag, p, o) in zip(cols, active_pairs):
+            stake, edge = kelly_stake(p, o, r['bankroll'])
+            col.metric(f"{tag} @ {o:.2f}", f"${stake:.2f}",
+                       f"edge {edge*100:+.1f}%")
+
+    # Mercados derivados
     st.markdown("---")
     st.markdown("**Mercados derivados (solo modelo)**")
     e = r['extras']
